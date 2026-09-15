@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -26,8 +27,9 @@ type Config struct {
 	ListenAddr        string            // address this node serves gRPC on
 	Peers             map[uint64]string // id -> address for every node, including self
 	DataDir           string
-	FullFsync         bool // see raft.Config.FullFsync
-	SnapshotThreshold int  // compact once this many log entries accumulate; 0 disables
+	FullFsync         bool   // see raft.Config.FullFsync
+	SnapshotThreshold int    // compact once this many log entries accumulate; 0 disables
+	MetricsAddr       string // if set, serve Prometheus metrics at http://MetricsAddr/metrics
 	Logger            *log.Logger
 }
 
@@ -37,14 +39,16 @@ type Node struct {
 	pb.UnimplementedRaftServer
 	pb.UnimplementedKVServer
 
-	cfg       Config
-	logger    *log.Logger
-	raft      *raft.Raft
-	transport *raft.GRPCTransport
-	sm        *kv.StateMachine
-	applyCh   chan raft.ApplyMsg
-	grpcSrv   *grpc.Server
-	listener  net.Listener
+	cfg        Config
+	logger     *log.Logger
+	raft       *raft.Raft
+	transport  *raft.GRPCTransport
+	sm         *kv.StateMachine
+	applyCh    chan raft.ApplyMsg
+	grpcSrv    *grpc.Server
+	listener   net.Listener
+	metrics    *Metrics
+	metricsSrv *http.Server
 
 	mu      sync.Mutex
 	waiters map[uint64]chan applyOutcome
@@ -97,6 +101,7 @@ func NewNode(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	n.raft = r
+	n.metrics = newMetrics(n)
 	return n, nil
 }
 
@@ -116,6 +121,18 @@ func (n *Node) Start() error {
 		n.serveErr <- n.grpcSrv.Serve(lis)
 	}()
 	n.logger.Printf("node[%d]: serving on %s", n.cfg.ID, lis.Addr())
+
+	if n.cfg.MetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", n.metrics.Handler())
+		n.metricsSrv = &http.Server{Addr: n.cfg.MetricsAddr, Handler: mux}
+		go func() {
+			if err := n.metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				n.logger.Printf("node[%d]: metrics server: %v", n.cfg.ID, err)
+			}
+		}()
+		n.logger.Printf("node[%d]: metrics on http://%s/metrics", n.cfg.ID, n.cfg.MetricsAddr)
+	}
 	return nil
 }
 
@@ -132,6 +149,9 @@ func (n *Node) Transport() *raft.GRPCTransport {
 // Stop shuts the node down. Safe to call once.
 func (n *Node) Stop() {
 	n.grpcSrv.Stop()
+	if n.metricsSrv != nil {
+		n.metricsSrv.Close()
+	}
 	// Kill Raft while the apply loop is still draining so the applier
 	// goroutine can never block forever on the apply channel.
 	n.raft.Kill()
@@ -200,7 +220,7 @@ func (n *Node) maybeSnapshot(appliedIndex uint64) {
 
 // ---------------- Proposals ----------------
 
-var errNotLeader = "NOT_LEADER"
+const errNotLeader = "NOT_LEADER"
 
 func (n *Node) notLeaderErr() error {
 	hint := ""
@@ -210,8 +230,32 @@ func (n *Node) notLeaderErr() error {
 	return status.Errorf(codes.FailedPrecondition, "%s leader_hint=%s", errNotLeader, hint)
 }
 
+// opName maps a command's op code to the lowercase label used in metrics.
+func opName(op pb.Command_Op) string {
+	switch op {
+	case pb.Command_GET:
+		return "get"
+	case pb.Command_PUT:
+		return "put"
+	case pb.Command_DELETE:
+		return "delete"
+	default:
+		return "unknown"
+	}
+}
+
 // propose replicates cmd through Raft and waits for it to be applied.
 func (n *Node) propose(ctx context.Context, cmd *pb.Command) (kv.Result, error) {
+	start := time.Now()
+	om := n.metrics.forOp(opName(cmd.Op))
+	res, err := n.doPropose(ctx, cmd)
+	if om != nil {
+		om.observe(time.Since(start), err)
+	}
+	return res, err
+}
+
+func (n *Node) doPropose(ctx context.Context, cmd *pb.Command) (kv.Result, error) {
 	data, err := proto.Marshal(cmd)
 	if err != nil {
 		return kv.Result{}, status.Errorf(codes.Internal, "marshal command: %v", err)
@@ -223,6 +267,7 @@ func (n *Node) propose(ctx context.Context, cmd *pb.Command) (kv.Result, error) 
 	index, _, isLeader := n.raft.Propose(data)
 	if !isLeader {
 		n.mu.Unlock()
+		n.metrics.recordNotLeader()
 		return kv.Result{}, n.notLeaderErr()
 	}
 	ch := make(chan applyOutcome, 1)
@@ -239,10 +284,12 @@ func (n *Node) propose(ctx context.Context, cmd *pb.Command) (kv.Result, error) 
 		if out.noop || out.clientID != cmd.ClientId || out.seq != cmd.Seq {
 			// A different command was committed at our index: this node
 			// lost leadership before our entry was replicated.
+			n.metrics.recordNotLeader()
 			return kv.Result{}, n.notLeaderErr()
 		}
 		return out.result, nil
 	case <-time.After(proposeTimeout):
+		n.metrics.recordTimeout()
 		return kv.Result{}, status.Errorf(codes.Unavailable, "commit timeout (no quorum or leadership lost)")
 	case <-ctx.Done():
 		return kv.Result{}, status.FromContextError(ctx.Err()).Err()

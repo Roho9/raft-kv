@@ -218,6 +218,13 @@ func (r *Raft) LogEntryCount() int {
 	return len(r.log) - 1
 }
 
+// CommitIndex returns the highest log index known to be committed.
+func (r *Raft) CommitIndex() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.commitIndex
+}
+
 // Propose appends a command to the log if this node is the leader.
 // Returns the entry's index and term, and false if not leader.
 func (r *Raft) Propose(data []byte) (uint64, uint64, bool) {

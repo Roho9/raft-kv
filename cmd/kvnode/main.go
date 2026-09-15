@@ -27,6 +27,7 @@ func main() {
 	dataDir := flag.String("data-dir", "", "directory for persistent state")
 	snapThreshold := flag.Int("snapshot-threshold", 8192, "log entries kept before compacting into a snapshot")
 	fullFsync := flag.Bool("full-fsync", false, "force full disk cache flushes on WAL syncs (slower; survives power loss on a majority of nodes)")
+	metricsAddr := flag.String("metrics-addr", "", "if set, serve Prometheus metrics at http://<addr>/metrics (e.g. :9001)")
 	flag.Parse()
 
 	if *id == 0 || *peersFlag == "" || *dataDir == "" {
@@ -61,6 +62,7 @@ func main() {
 		DataDir:           *dataDir,
 		FullFsync:         *fullFsync,
 		SnapshotThreshold: *snapThreshold,
+		MetricsAddr:       *metricsAddr,
 		Logger:            logger,
 	})
 	if err != nil {

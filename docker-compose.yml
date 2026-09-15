@@ -1,23 +1,26 @@
 services:
   node1:
     build: .
-    command: ["--id", "1", "--peers", "1=node1:7001,2=node2:7002,3=node3:7003", "--data-dir", "/data"]
+    command: ["--id", "1", "--peers", "1=node1:7001,2=node2:7002,3=node3:7003", "--data-dir", "/data", "--metrics-addr", ":9001"]
     ports:
       - "7001:7001"
+      - "9001:9001"
     volumes:
       - node1-data:/data
   node2:
     build: .
-    command: ["--id", "2", "--peers", "1=node1:7001,2=node2:7002,3=node3:7003", "--data-dir", "/data"]
+    command: ["--id", "2", "--peers", "1=node1:7001,2=node2:7002,3=node3:7003", "--data-dir", "/data", "--metrics-addr", ":9002"]
     ports:
       - "7002:7002"
+      - "9002:9002"
     volumes:
       - node2-data:/data
   node3:
     build: .
-    command: ["--id", "3", "--peers", "1=node1:7001,2=node2:7002,3=node3:7003", "--data-dir", "/data"]
+    command: ["--id", "3", "--peers", "1=node1:7001,2=node2:7002,3=node3:7003", "--data-dir", "/data", "--metrics-addr", ":9003"]
     ports:
       - "7003:7003"
+      - "9003:9003"
     volumes:
       - node3-data:/data
 

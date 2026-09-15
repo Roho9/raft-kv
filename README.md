@@ -1,5 +1,7 @@
 # raft-kv
 
+[![CI](https://github.com/Roho9/raft-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/Roho9/raft-kv/actions/workflows/ci.yml)
+
 A fault-tolerant distributed key-value store built from scratch in Go on the
 [Raft consensus algorithm](https://raft.github.io/raft.pdf). A 3-node cluster
 survives any single-node failure while serving fully linearizable reads and
@@ -25,6 +27,11 @@ writes over gRPC.
   through simulated network partitions.
 - **Containerized**: one static binary per node, with a Docker Compose file
   that brings up a reproducible 3-node cluster.
+- **Observable**: each node optionally exposes Prometheus metrics (leader
+  status, term, commit index, per-operation latency histograms) so cluster
+  behavior can be verified against a scraper, not just log lines.
+- **CI**: every push and pull request builds, vets, gofmt-checks, and runs
+  the full test suite (including the race detector) via GitHub Actions.
 
 ## Layout
 
@@ -33,11 +40,12 @@ proto/       protobuf definitions for Raft RPCs and the KV service
 gen/         generated protobuf and gRPC code
 raft/        consensus core: elections, replication, storage, snapshots
 kv/          replicated state machine with client session dedup
-server/      node wiring: gRPC services, apply loop, snapshot trigger
+server/      node wiring: gRPC services, apply loop, snapshot trigger, metrics
 client/      cluster-aware client with leader discovery and retries
 cmd/kvnode   node daemon
 cmd/kvbench  load generator reporting throughput and latency percentiles
 tests/       end-to-end cluster tests (failover, partitions, snapshots)
+.github/     CI workflow (build, vet, gofmt check, race-detector tests)
 ```
 
 ## Quick start
@@ -86,16 +94,23 @@ number so a retry can never apply twice.
 make test           # full suite with the race detector
 ```
 
-The suite covers:
+Two layers:
 
-- leader election and re-election after leader death
-- durability of committed writes across leader failover
-- an isolated leader stepping down and the majority side continuing to commit
-- snapshot-based catch-up of a follower that missed compacted log entries
-- full-cluster restart recovery from the WAL and snapshots
-- 10,000 concurrent writes with a mid-run leader partition, verifying every
-  acknowledged write is durable and reads return the last acknowledged value
-- at-most-once application of retried requests
+- **Unit tests** (`raft/storage_test.go`, `kv/statemachine_test.go`) exercise
+  the WAL and state machine in isolation: crash recovery from a torn tail
+  write, snapshot save/load round trips, log rewriting after a conflict, and
+  the idempotency guarantees (replayed and cross-client requests) the client
+  relies on.
+- **End-to-end cluster tests** (`tests/cluster_test.go`) run real in-process
+  nodes over gRPC and cover:
+  - leader election and re-election after leader death
+  - durability of committed writes across leader failover
+  - an isolated leader stepping down and the majority side continuing to commit
+  - snapshot-based catch-up of a follower that missed compacted log entries
+  - full-cluster restart recovery from the WAL and snapshots
+  - 10,000 concurrent writes with a mid-run leader partition, verifying every
+    acknowledged write is durable and reads return the last acknowledged value
+  - at-most-once application of retried requests
 
 ## Benchmarking
 
@@ -128,6 +143,34 @@ it is durable there. By default WAL syncs use plain fsync (fdatasync on
 Linux), which survives process crashes; pass `--full-fsync` to force full
 disk cache flushes (F_FULLFSYNC on macOS, roughly 10ms per flush) if you
 want single-node power-loss durability at a large throughput cost.
+
+## Metrics
+
+Pass `--metrics-addr :9001` to serve Prometheus metrics for that node:
+
+```sh
+bin/kvnode --id 1 --peers ... --data-dir data/n1 --metrics-addr :9001
+curl localhost:9001/metrics
+```
+
+Exposed series, all labeled with `node_id`:
+
+| metric | meaning |
+|---|---|
+| `raftkv_is_leader` | 1 if this node currently believes it is leader |
+| `raftkv_term` | current Raft term |
+| `raftkv_commit_index` | highest committed log index |
+| `raftkv_log_entries` | in-memory log entries since the last snapshot |
+| `raftkv_keys` | keys currently in the state machine |
+| `raftkv_requests_total{op,outcome}` | completed requests by operation and success/error |
+| `raftkv_request_duration_seconds` | histogram of end-to-end request latency, per operation |
+| `raftkv_not_leader_redirects_total` | requests rejected because this node wasn't leader |
+| `raftkv_commit_timeouts_total` | proposals that timed out waiting for commit |
+
+`docker-compose.yml` exposes each node's metrics on host ports 9001-9003;
+`scripts/run-local-cluster.sh` does the same for a local run. Because only
+the current leader accumulates `outcome="success"`, scraping all three nodes
+and comparing `raftkv_is_leader` is enough to watch a failover happen live.
 
 ## Design notes
 
