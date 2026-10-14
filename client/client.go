@@ -138,7 +138,11 @@ func (c *Client) call(ctx context.Context, op func(ctx context.Context, stub pb.
 		} else {
 			c.rotate()
 		}
-		time.Sleep(retryPause)
+		select {
+		case <-time.After(retryPause):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return fmt.Errorf("operation failed after %d attempts: %w", maxAttempts, lastErr)
 }
